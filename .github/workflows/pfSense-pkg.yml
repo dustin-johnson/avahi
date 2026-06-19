@@ -1,0 +1,110 @@
+name: Build pfSense Package (FreeBSD)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, pfsense-package ]
+
+jobs:
+  build-freebsd-pkg:
+    name: Build avahi pkg for pfSense (FreeBSD 15.0)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build on FreeBSD 15.0
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.0"
+          usesh: true
+          prepare: |
+            pkg install -y \
+              bash gmake \
+              autoconf automake libtool pkgconf \
+              dbus dbus-glib \
+              libdaemon gdbm \
+              gettext intltool \
+              p5-XML-Parser
+
+          run: |
+            set -e
+
+            # FreeBSD installs everything under /usr/local; the base
+            # toolchain does not search there by default.
+            export CPPFLAGS="-I/usr/local/include"
+            export LDFLAGS="-L/usr/local/lib"
+            export PKG_CONFIG_PATH="/usr/local/libdata/pkgconfig"
+
+            ./autogen.sh \
+              --prefix=/usr/local \
+              --sysconfdir=/usr/local/etc \
+              --localstatedir=/var \
+              --disable-qt3 --disable-qt4 --disable-qt5 \
+              --disable-gtk --disable-gtk3 \
+              --disable-glib --disable-gobject \
+              --disable-python --disable-mono \
+              --disable-monodoc --disable-doxygen-doc \
+              --disable-doxygen-dot \
+              --disable-libevent \
+              --disable-libsystemd \
+              --disable-nls \
+              --disable-xmltoman \
+              --disable-manpages \
+              --disable-autoipd \
+              --with-distro=none \
+              --enable-compat-libdns_sd \
+              --with-avahi-user=avahi \
+              --with-avahi-group=avahi
+
+            gmake -j$(sysctl -n hw.ncpu)
+
+            gmake install DESTDIR=$(pwd)/pkg-root
+
+            # Build the FreeBSD pkg
+            PKG_VERSION="0.9.rc4.nsec.1"
+            STAGEDIR=$(pwd)/pkg-root
+            METADIR=$(pwd)/pkg-meta
+            mkdir -p ${METADIR} $(pwd)/dist
+
+            # Plist: every installed file/symlink, path relative to prefix
+            ( cd ${STAGEDIR}/usr/local && \
+              find . \( -type f -o -type l \) | sed 's|^\./||' | sort ) \
+              > ${METADIR}/pkg-plist
+
+            echo "=== Files to be packaged ==="
+            wc -l ${METADIR}/pkg-plist
+            cat ${METADIR}/pkg-plist
+
+            cat > ${METADIR}/+MANIFEST << MANIFEST
+            name: avahi-app-nsec
+            version: "${PKG_VERSION}"
+            origin: net/avahi-app-nsec
+            comment: "Avahi mDNS/DNS-SD daemon with NSEC record reflection fix"
+            desc: "Avahi 0.9-rc4 with proper NSEC record parsing/serialization to fix mDNS reflection on multi-interface networks (pfSense). Patch adds NSEC as a first-class record type so compressed domain name pointers are correctly re-encoded during reflection."
+            maintainer: "dustin.johnson@seeq.com"
+            www: "https://github.com/dustin-johnson/avahi"
+            abi: "FreeBSD:15:amd64"
+            arch: "freebsd:15:x86:64"
+            prefix: /usr/local
+            flatsize: $(du -sk ${STAGEDIR}/usr/local | awk '{print $1 * 1024}')
+            licenses: [ LGPL21 ]
+            categories: [ net ]
+            MANIFEST
+
+            # Create the pkg from staging root + metadata + plist
+            pkg create \
+              -r ${STAGEDIR} \
+              -m ${METADIR} \
+              -p ${METADIR}/pkg-plist \
+              -o $(pwd)/dist/
+
+            echo "=== Built package ==="
+            ls -lh $(pwd)/dist/
+
+      - name: Upload pkg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: avahi-app-nsec-freebsd15-amd64
+          path: dist/*.pkg
+          if-no-files-found: error
